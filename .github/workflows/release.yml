@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build signed ARM APKs
+    name: Build signed arm64-v8a APK
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     defaults:
@@ -25,7 +25,8 @@ jobs:
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
       JOBS: '2'
-      ABIS: 'armeabi-v7a arm64-v8a'
+      ABIS: 'arm64-v8a'
+      NATIVE_TARGET: 'arm64-v8a'
 
     steps:
       - name: Checkout source
@@ -158,9 +159,8 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            TMessagesProj/src/main/libs/armeabi-v7a/libtmessages*.so
             TMessagesProj/src/main/libs/arm64-v8a/libtmessages*.so
-          key: native-signed-v1-${{ runner.os }}-ndk27-${{ hashFiles('native-inputs.txt') }}
+          key: native-signed-arm64-v2-${{ runner.os }}-ndk27-${{ hashFiles('native-inputs.txt') }}
 
       - name: Install native build tools
         if: steps.native-cache.outputs.cache-hit != 'true'
@@ -178,22 +178,27 @@ jobs:
           ./run init libs libvpx
           ./run init libs dav1d
           ./run init libs ffmpeg
-          ./run init libs boringssl
+          # The upstream BoringSSL wrapper always builds both ARM architectures.
+          # Call its build script directly with the arm64 target.
+          source bin/init/env.sh
+          export PATH="$ANDROID_HOME/cmake/3.22.1/bin:$PATH"
+          export NINJA_PATH="$(command -v ninja)"
+          (
+            cd TMessagesProj/jni
+            ./patch_boringssl.sh
+            ./build_boringssl.sh arm64
+          )
 
       - name: Compile Telegram native libraries
         if: steps.native-cache.outputs.cache-hit != 'true'
         run: |
-          for abi in armeabi-v7a arm64-v8a; do
-            NATIVE_TARGET="$abi" ./run libs native
-          done
+          ./run libs native
 
-      - name: Check both native architectures
+      - name: Check arm64-v8a native library
         run: |
-          for abi in armeabi-v7a arm64-v8a; do
-            test -s "TMessagesProj/src/main/libs/$abi/libtmessages.49.so"
-          done
+          test -s TMessagesProj/src/main/libs/arm64-v8a/libtmessages.49.so
 
-      - name: Build signed Release APKs
+      - name: Build signed arm64-v8a Release APK
         env:
           KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
           ALIAS_NAME: ${{ secrets.ALIAS_NAME }}
@@ -204,12 +209,15 @@ jobs:
           ./gradlew :TMessagesProj:assembleRelease \
             --no-daemon --max-workers=2 --build-cache --no-configuration-cache
 
-      - name: Verify APK signatures and native libraries
+      - name: Verify and name the arm64-v8a APK
+        id: package
         run: |
           python3 - <<'PY'
           import hashlib
           import os
           from pathlib import Path
+          import re
+          import shutil
           import subprocess
           import zipfile
 
@@ -217,29 +225,48 @@ jobs:
           expected = hashlib.sha256(cert.read_bytes()).hexdigest()
           apksigner = Path(os.environ['ANDROID_HOME']) / 'build-tools/36.0.0/apksigner'
           root = Path('TMessagesProj/build/outputs/apk/release')
-          for abi in ('armeabi-v7a', 'arm64-v8a'):
-              apks = list(root.glob('*' + abi + '*.apk'))
-              if len(apks) != 1:
-                  raise SystemExit('Expected exactly one Release APK for ' + abi)
-              apk = apks[0]
-              result = subprocess.run([str(apksigner), 'verify', '--verbose', '--print-certs', str(apk)],
-                                      check=True, capture_output=True, text=True)
-              if ('Signer #1 certificate SHA-256 digest: ' + expected).lower() not in result.stdout.lower():
-                  raise SystemExit('The APK signing certificate does not match the configured keystore.')
-              if 'Verified using v2 scheme (APK Signature Scheme v2): true' not in result.stdout:
-                  raise SystemExit('APK v2 signing is required by the native signature check.')
-              with zipfile.ZipFile(apk) as archive:
-                  info = archive.getinfo('lib/' + abi + '/libtmessages.49.so')
-                  if info.file_size == 0:
-                      raise SystemExit('The packaged native library is empty.')
-              print('Verified:', apk.name)
+          apks = list(root.glob('*.apk'))
+          if len(apks) != 1 or 'arm64-v8a' not in apks[0].name:
+              raise SystemExit('Expected exactly one arm64-v8a Release APK.')
+          apk = apks[0]
+          result = subprocess.run([str(apksigner), 'verify', '--verbose', '--print-certs', str(apk)],
+                                  check=True, capture_output=True, text=True)
+          if ('Signer #1 certificate SHA-256 digest: ' + expected).lower() not in result.stdout.lower():
+              raise SystemExit('The APK signing certificate does not match the configured keystore.')
+          if 'Verified using v2 scheme (APK Signature Scheme v2): true' not in result.stdout:
+              raise SystemExit('APK v2 signing is required by the native signature check.')
+          with zipfile.ZipFile(apk) as archive:
+              info = archive.getinfo('lib/arm64-v8a/libtmessages.49.so')
+              if info.file_size == 0:
+                  raise SystemExit('The packaged native library is empty.')
+              abis = {name.split('/')[1] for name in archive.namelist()
+                      if name.startswith('lib/') and name.endswith('.so')}
+              if abis != {'arm64-v8a'}:
+                  raise SystemExit('The APK contains an unexpected native architecture.')
+
+          properties = Path('gradle.properties').read_text(encoding='utf-8')
+          versions = re.findall(r'^APP_VERSION_NAME[ \t]*=[ \t]*(.+)$', properties, re.MULTILINE)
+          if len(versions) != 1:
+              raise SystemExit('Expected one APP_VERSION_NAME in gradle.properties.')
+          version = versions[0].strip()
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*', version):
+              raise SystemExit('APP_VERSION_NAME contains unsupported filename characters.')
+          name = 'nagram_' + version
+          destination = Path('artifacts') / (name + '.apk')
+          destination.parent.mkdir(exist_ok=True)
+          # Copy the signed file unchanged: its filename is not part of the signature.
+          shutil.copyfile(apk, destination)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('artifact_name=' + name + '\n')
+              output.write('apk_path=' + destination.as_posix() + '\n')
+          print('Verified and packaged:', destination.name)
           PY
 
-      - name: Upload signed APKs
+      - name: Upload signed APK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: Signed-Release-APKs-${{ github.run_number }}
-          path: TMessagesProj/build/outputs/apk/release/*.apk
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.apk_path }}
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
